@@ -1,0 +1,241 @@
+name: C16 Chromium Browser Alpha
+
+on:
+  push:
+    branches:
+      - c16-browser-build
+    paths:
+      - 'c16/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout build branch
+        uses: actions/checkout@v4
+
+      - name: Download latest full Chromium Android Desktop ARM64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, urllib.request
+          release_api = 'https://api.github.com/repos/andrewginns/chromium-browser-snapshots-AndroidDesktop_arm64/releases/latest'
+          req = urllib.request.Request(release_api, headers={'User-Agent':'C16-Browser-Builder'})
+          with urllib.request.urlopen(req, timeout=60) as r:
+              release = json.load(r)
+          asset = next((a for a in release.get('assets', []) if a.get('name') == 'ChromePublic.apk'), None)
+          if not asset:
+              raise SystemExit('ChromePublic.apk is missing from the latest Chromium Android Desktop ARM64 release')
+          print('CHROMIUM_SNAPSHOT=' + str(release.get('tag_name')))
+          print('SOURCE=' + asset['browser_download_url'])
+          urllib.request.urlretrieve(asset['browser_download_url'], 'ChromePublic.apk')
+          with open('CHROMIUM_SNAPSHOT.txt','w',encoding='utf-8') as f:
+              f.write(str(release.get('tag_name')) + '\n')
+          PY
+          ls -lh ChromePublic.apk
+          sha256sum ChromePublic.apk
+
+      - name: Download current Apktool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, urllib.request
+          api='https://api.github.com/repos/iBotPeaches/Apktool/releases/latest'
+          req=urllib.request.Request(api, headers={'User-Agent':'C16-Browser-Builder'})
+          with urllib.request.urlopen(req, timeout=60) as r:
+              rel=json.load(r)
+          jar=next((a for a in rel.get('assets',[]) if a.get('name','').endswith('.jar') and 'apktool' in a.get('name','').lower()),None)
+          if not jar:
+              raise SystemExit('apktool jar not found')
+          print('APKTOOL=' + jar['name'])
+          urllib.request.urlretrieve(jar['browser_download_url'],'apktool.jar')
+          PY
+          java -jar apktool.jar --version
+
+      - name: Decode Chromium APK resources only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          java -Xmx5g -jar apktool.jar d -f -s ChromePublic.apk -o c16-decoded
+          du -sh c16-decoded
+
+      - name: Apply C16 Browser car-display patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import re
+
+          root = Path('c16-decoded')
+          manifest = root / 'AndroidManifest.xml'
+          ANDROID = 'http://schemas.android.com/apk/res/android'
+          A = '{%s}' % ANDROID
+          ET.register_namespace('android', ANDROID)
+
+          # --- Manifest: brand + landscape launcher ---
+          tree = ET.parse(manifest)
+          mr = tree.getroot()
+          app = mr.find('application')
+          if app is not None:
+              app.set(A+'label', 'C16 Browser')
+              app.set(A+'resizeableActivity', 'true')
+
+          activities = list(mr.findall('./application/activity'))
+          aliases = list(mr.findall('./application/activity-alias'))
+          launcher_nodes = []
+          for node in activities + aliases:
+              for filt in node.findall('intent-filter'):
+                  actions = {x.get(A+'name') for x in filt.findall('action')}
+                  cats = {x.get(A+'name') for x in filt.findall('category')}
+                  if 'android.intent.action.MAIN' in actions and 'android.intent.category.LAUNCHER' in cats:
+                      launcher_nodes.append(node)
+
+          for launcher in launcher_nodes:
+              launcher.set(A+'label', 'C16 Browser')
+              if launcher.tag == 'activity':
+                  launcher.set(A+'screenOrientation', 'landscape')
+              else:
+                  target = launcher.get(A+'targetActivity')
+                  if target:
+                      for act in activities:
+                          if act.get(A+'name') == target:
+                              act.set(A+'screenOrientation', 'landscape')
+                              act.set(A+'resizeableActivity', 'true')
+          tree.write(manifest, encoding='utf-8', xml_declaration=True)
+          print('launcher nodes:', len(launcher_nodes))
+
+          # --- Branding strings ---
+          brand_names = {
+              'app_name','application_name','product_name','chrome_app_name','chrome_name',
+              'application_label','app_label','browser_app_name'
+          }
+          brand_count = 0
+          for p in root.glob('res/values*/strings.xml'):
+              try:
+                  t=ET.parse(p); rr=t.getroot(); changed=False
+                  for el in rr.findall('string'):
+                      n=el.get('name','')
+                      text=''.join(el.itertext()).strip() if el.text is not None else ''
+                      if n in brand_names or text == 'Chromium':
+                          el.text='C16 Browser'; changed=True; brand_count += 1
+                  if changed:
+                      t.write(p, encoding='utf-8', xml_declaration=True)
+              except Exception as e:
+                  print('skip strings',p,e)
+          print('branding strings patched:', brand_count)
+
+          # --- 14.6-inch car UI dimensions ---
+          exact = {
+              'toolbar_height':'64dp',
+              'toolbar_height_tablet':'64dp',
+              'toolbar_height_no_shadow':'64dp',
+              'tab_strip_height':'52dp',
+              'tabstrip_height':'52dp',
+              'tab_height':'52dp',
+              'tab_strip_toolbar_height':'52dp',
+              'toolbar_button_width':'58dp',
+              'toolbar_button_height':'58dp',
+              'toolbar_button_size':'58dp',
+              'new_tab_button_width':'60dp',
+              'new_tab_button_height':'60dp',
+              'new_tab_button_size':'60dp',
+              'location_bar_text_size':'19sp',
+              'omnibox_text_size':'19sp',
+              'url_bar_text_size':'19sp',
+              'tab_title_text_size':'18sp',
+              'tab_text_size':'18sp',
+              'tab_strip_text_size':'18sp',
+              'omnibox_suggestion_height':'58dp',
+              'omnibox_suggestion_row_height':'58dp',
+          }
+          patched=[]
+          for p in root.glob('res/values*/dimens.xml'):
+              try:
+                  t=ET.parse(p); rr=t.getroot(); changed=False
+                  for el in rr.findall('dimen'):
+                      n=el.get('name','')
+                      if n in exact:
+                          old=el.text; el.text=exact[n]; changed=True
+                          patched.append((n,old,el.text,str(p)))
+                  if changed:
+                      t.write(p, encoding='utf-8', xml_declaration=True)
+              except Exception as e:
+                  print('skip dimens',p,e)
+          print('dimension patches:', len(patched))
+          for x in patched[:120]: print('DIM',*x)
+
+          # --- Extra touch-space heuristic for Chromium tablet toolbar resources ---
+          # Only patch explicit toolbar/tab/omnibox named dimensions, never global paddings.
+          candidates=[]
+          for p in root.glob('res/values*/dimens.xml'):
+              try:
+                  t=ET.parse(p); rr=t.getroot()
+                  for el in rr.findall('dimen'):
+                      n=el.get('name','')
+                      if any(k in n for k in ('toolbar','tab_strip','tabstrip','omnibox','location_bar')):
+                          candidates.append((n,el.text,str(p)))
+              except Exception:
+                  pass
+          Path('c16-dimension-candidates.txt').write_text('\n'.join('\t'.join(map(str,x)) for x in candidates[:1000]),encoding='utf-8')
+
+          # Build marker used to distinguish the C16 package during testing.
+          Path('C16_BUILD_INFO.txt').write_text(
+              'C16 Browser Alpha\nFull Chromium Android Desktop ARM64\nNo Android WebView wrapper\nLandscape car-display resource patch\n',
+              encoding='utf-8'
+          )
+          PY
+
+      - name: Rebuild full Chromium APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          java -Xmx5g -jar apktool.jar b c16-decoded -o C16Browser-unsigned.apk
+          ls -lh C16Browser-unsigned.apk
+
+      - name: Align and sign C16 Browser APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          echo "BUILD_TOOLS=$BUILD_TOOLS"
+          keytool -genkeypair -v \
+            -keystore c16-release.jks \
+            -storepass c16browser \
+            -keypass c16browser \
+            -alias c16 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname 'CN=C16 Browser, OU=Car Browser, O=C16, L=Kunming, ST=Yunnan, C=CN'
+          "$BUILD_TOOLS/zipalign" -f -p 4 C16Browser-unsigned.apk C16Browser-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks c16-release.jks \
+            --ks-key-alias c16 \
+            --ks-pass pass:c16browser \
+            --key-pass pass:c16browser \
+            --out C16Browser-Alpha.apk \
+            C16Browser-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs C16Browser-Alpha.apk
+          sha256sum C16Browser-Alpha.apk | tee C16Browser-Alpha.apk.sha256
+          ls -lh C16Browser-Alpha.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: C16Browser-Alpha-APK
+          path: |
+            C16Browser-Alpha.apk
+            C16Browser-Alpha.apk.sha256
+            CHROMIUM_SNAPSHOT.txt
+            C16_BUILD_INFO.txt
+            c16-dimension-candidates.txt
+          if-no-files-found: error
+          compression-level: 0
